@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="24" fill="#0C5A4C"/>
+  <!-- damma (from the Cairo typeface, matching the wordmark) -->
+  <path transform="translate(41 10) scale(0.068 -0.068) translate(-19 -696)" d="M98 535Q82 607 98.5 651.5Q115 696 174 696Q213 696 233.0 675.5Q253 655 257.0 619.0Q261 583 250 535L203 544Q216 603 208.0 625.5Q200 648 174 648Q148 648 140.0 626.0Q132 604 145 545ZM19 535V583H250V535Z" fill="#D79313"/>
+  <!-- person rising from a chair: the loop of م is the head, its tail the body -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" transform="translate(9 19) scale(0.82)">
+    <path d="M70 64 H82 M82 47 V84" stroke="#fff" stroke-opacity=".45" stroke-width="7"/>
+    <circle cx="44" cy="24" r="9.5" stroke="#fff" stroke-width="9.5"/>
+    <path d="M49 35 C55 42 61 48 63 56 C54 58 46 60 40 62 C40 69 40 75 39 82 L30 82" stroke="#fff" stroke-width="12"/>
+  </g>
+</svg>

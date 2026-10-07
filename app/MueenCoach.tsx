@@ -138,6 +138,22 @@ async function createLandmarker() {
   }
 }
 
+// ---------- Logo ----------
+// Person rising from a chair: the loop of م is the head, its tail the body; damma on top.
+function MueenLogo({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 100 100" className={className} aria-hidden="true">
+      <rect width="100" height="100" rx="24" fill="#0C5A4C" />
+      <path transform="translate(41 10) scale(0.068 -0.068) translate(-19 -696)" fill="#D79313" d="M98 535Q82 607 98.5 651.5Q115 696 174 696Q213 696 233.0 675.5Q253 655 257.0 619.0Q261 583 250 535L203 544Q216 603 208.0 625.5Q200 648 174 648Q148 648 140.0 626.0Q132 604 145 545ZM19 535V583H250V535Z" />
+      <g fill="none" strokeLinecap="round" strokeLinejoin="round" transform="translate(9 19) scale(0.82)">
+        <path d="M70 64 H82 M82 47 V84" stroke="#fff" strokeOpacity={0.45} strokeWidth={7} />
+        <circle cx="44" cy="24" r="9.5" stroke="#fff" strokeWidth={9.5} />
+        <path d="M49 35 C55 42 61 48 63 56 C54 58 46 60 40 62 C40 69 40 75 39 82 L30 82" stroke="#fff" strokeWidth={12} />
+      </g>
+    </svg>
+  );
+}
+
 // ---------- Component ----------
 export default function MueenCoach() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -562,8 +578,8 @@ export default function MueenCoach() {
       <div className="mx-auto max-w-[1400px] px-5 py-7 sm:px-8 lg:px-12 lg:py-10">
         <header className="flex flex-wrap items-center justify-between gap-5 border-b border-border/70 pb-7">
           <div className="flex items-center gap-4">
-            <div className="grid size-16 shrink-0 place-items-center rounded-[20px] bg-primary text-primary-foreground shadow-action" aria-hidden="true"><span className="text-4xl font-extrabold">م</span></div>
-            <div><h1 className="text-4xl font-extrabold leading-tight">معين</h1><p className="mt-1 text-lg font-medium text-muted-foreground">معك، في كل حركة</p></div>
+            <MueenLogo className="size-16 shrink-0 rounded-[20px] shadow-action" />
+            <div><h1 className="text-4xl font-extrabold leading-tight">مُعين</h1><p className="mt-1 text-lg font-medium text-muted-foreground">معك، في كل حركة</p></div>
           </div>
         </header>
         <div className="flex flex-wrap items-end justify-between gap-4 pb-7 pt-8">
@@ -615,7 +631,7 @@ export default function MueenCoach() {
             <Button variant="exercise" size="exercise" onClick={startTest} disabled={!ready} className="mt-3"><Play className="fill-current" />{timeLeft === 0 ? "ابدأ التمرين من جديد" : "ابدأ التمرين"}</Button>
           </aside>
         </main>
-        <footer className="mt-9 flex flex-wrap items-center justify-between gap-3 border-t border-border/70 pt-5 text-sm text-muted-foreground"><span>معين · رفيق الحركة</span><span>بخطوات هادئة، نحو نشاط أفضل</span></footer>
+        <footer className="mt-9 flex flex-wrap items-center justify-between gap-3 border-t border-border/70 pt-5 text-sm text-muted-foreground"><span>مُعين · رفيق الحركة</span><span>بخطوات هادئة، نحو نشاط أفضل</span></footer>
       </div>
     </div>
   );
