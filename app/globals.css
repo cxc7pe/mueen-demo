@@ -1,0 +1,64 @@
+/* ============================================================
+   Mueen theme — Tailwind CSS v4 (globals.css)
+   Replace your app/globals.css with this file entirely
+   (or merge the @theme inline and :root blocks into yours).
+   ============================================================ */
+@import "tailwindcss";
+
+@theme inline {
+  --font-ar: "Cairo", sans-serif;
+  --font-num: "IBM Plex Mono", monospace;
+  --color-brand-deep: var(--brand-deep);
+  --color-amber: var(--amber);
+  --color-amber-deep: var(--amber-deep);
+  --color-amber-edge: var(--amber-edge);
+  --color-surface-edge: var(--surface-edge);
+  --color-warmsoft: var(--warmsoft);
+  --shadow-frost: 0 16px 40px -24px var(--shadow-tint);
+  --shadow-soft: 0 6px 20px -14px var(--shadow-tint);
+  --shadow-action: 0 12px 24px -12px var(--primary);
+  --background-image-wellness: linear-gradient(120deg, var(--mint-surface), var(--background) 48%, var(--warm-surface));
+}
+
+:root {
+  --background: oklch(0.984 0.009 135);
+  --foreground: oklch(0.318 0.048 179);
+  --card: oklch(1 0 0);
+  --card-foreground: var(--foreground);
+  --popover: var(--card);
+  --popover-foreground: var(--foreground);
+  --primary: oklch(0.521 0.092 177.4);
+  --primary-foreground: oklch(1 0 0);
+  --brand-deep: oklch(0.42 0.074 176.7);
+  --secondary: oklch(0.917 0.031 172.8);
+  --secondary-foreground: var(--brand-deep);
+  --muted: oklch(0.925 0.017 155);
+  --muted-foreground: oklch(0.46 0.046 177);
+  --accent: oklch(0.748 0.145 65.7);
+  --accent-foreground: var(--foreground);
+  --amber: var(--accent);
+  --amber-deep: oklch(0.593 0.13 62.3);
+  --amber-edge: oklch(0.9 0.055 77);
+  --warmsoft: oklch(0.961 0.02 85.8);
+  --surface-edge: oklch(1 0 0 / 85%);
+  --border: oklch(0.89 0.025 160);
+  --input: var(--border);
+  --ring: var(--primary);
+  --mint-surface: oklch(0.96 0.025 163);
+  --warm-surface: oklch(0.964 0.023 85);
+  --shadow-tint: oklch(0.318 0.048 179 / 24%);
+}
+
+@layer base {
+  body {
+    font-family: var(--font-ar);
+    background-color: var(--background);
+    color: var(--foreground);
+  }
+  button { -webkit-tap-highlight-color: transparent; }
+  ::selection { background: var(--secondary); color: var(--brand-deep); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
