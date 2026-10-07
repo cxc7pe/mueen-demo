@@ -25,7 +25,13 @@ const HIP_FULL_EXTENSION_ANGLE = 155;
 const TORSO_LEAN_MAX_DEGREES = 45;
 // After reaching standing, wait this long (taking the best hip angle) before judging.
 const STAND_SETTLE_SEC = 0.7;
-const ARM_PUSH_DISTANCE_RATIO = 0.35;
+// Hands-on-thighs check: a wrist counts as "on the thigh" when it is this close to
+// the thigh (as a fraction of torso length), away from the hip end of the thigh.
+const HAND_ON_THIGH_DISTANCE = 0.3;
+const HAND_ON_THIGH_MIN_T = 0.3; // 0 = at the hip, 1 = at the knee
+// Warn only if the hand was on the thigh for at least this share of the rise
+const HAND_ON_THIGH_MIN_SHARE = 0.5;
+const MIN_WRIST_VISIBILITY = 0.5;
 const TEST_DURATION = 30;
 const SMOOTHING = 0.3;
 const FEEDBACK_COOLDOWN_SEC = 4.0;
@@ -40,7 +46,6 @@ const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPI
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 
-const exercisePreview = "/exercise-preview.jpg";
 
 const LEFT_HIP = 23, LEFT_KNEE = 25, LEFT_ANKLE = 27, LEFT_SHOULDER = 11, LEFT_WRIST = 15;
 const RIGHT_HIP = 24, RIGHT_KNEE = 26, RIGHT_ANKLE = 28, RIGHT_SHOULDER = 12, RIGHT_WRIST = 16;
@@ -60,6 +65,18 @@ function torsoLean(shoulder: number[], hip: number[]) {
   const dx = shoulder[0] - hip[0];
   const dy = shoulder[1] - hip[1];
   return Math.abs((Math.atan2(Math.abs(dx), Math.abs(dy)) * 180) / Math.PI);
+}
+
+// Is the wrist resting on the thigh (between mid-thigh and knee)?
+// Arms hanging at the sides or crossed on the chest do not count.
+function handOnThigh(wrist: number[], hip: number[], knee: number[], torsoLen: number) {
+  const tx = knee[0] - hip[0], ty = knee[1] - hip[1];
+  const len2 = tx * tx + ty * ty;
+  if (len2 < 1e-6) return false;
+  const t = ((wrist[0] - hip[0]) * tx + (wrist[1] - hip[1]) * ty) / len2;
+  if (t < HAND_ON_THIGH_MIN_T || t > 1.1) return false;
+  const px = hip[0] + t * tx, py = hip[1] + t * ty;
+  return Math.hypot(wrist[0] - px, wrist[1] - py) / torsoLen < HAND_ON_THIGH_DISTANCE;
 }
 
 function checkSitToStand(angle: number) {
@@ -147,7 +164,8 @@ export default function MueenCoach() {
     testStart: null as number | null,
     testDone: false,
     maxLean: 0,
-    maxWristRatio: 0,
+    riseFrames: 0,
+    handOnThighFrames: 0,
     // Feedback for the current rep is decided a moment after standing up
     judgeAt: null as number | null,
     maxHipTop: 0,
@@ -263,7 +281,12 @@ export default function MueenCoach() {
         const hipAngle = calcAngle(shoulder, hip, knee);
         const lean = torsoLean(shoulder, hip);
         const torsoLen = Math.hypot(shoulder[0] - hip[0], shoulder[1] - hip[1]) + 1e-6;
-        const wristHipRatio = Math.hypot(wrist[0] - hip[0], wrist[1] - hip[1]) / torsoLen;
+        // Either hand resting on its own thigh (only if the camera can see that wrist)
+        const handPush =
+          (vis(LEFT_WRIST) >= MIN_WRIST_VISIBILITY &&
+            handOnThigh(pt(LEFT_WRIST), pt(LEFT_HIP), pt(LEFT_KNEE), torsoLen)) ||
+          (vis(RIGHT_WRIST) >= MIN_WRIST_VISIBILITY &&
+            handOnThigh(pt(RIGHT_WRIST), pt(RIGHT_HIP), pt(RIGHT_KNEE), torsoLen));
 
         if (Number.isFinite(kneeAngle)) {
           s.smoothedKnee =
@@ -277,7 +300,8 @@ export default function MueenCoach() {
           // While rising out of the chair: track forward lean and arm use
           if (s.stage === "SITTING" && state !== "SITTING") {
             s.maxLean = Math.max(s.maxLean, lean);
-            s.maxWristRatio = Math.max(s.maxWristRatio, wristHipRatio);
+            s.riseFrames += 1;
+            if (handPush) s.handOnThighFrames += 1;
           }
 
           // After standing up: track how straight the hips get at the top
@@ -291,14 +315,17 @@ export default function MueenCoach() {
             const issues: string[] = [];
             if (s.maxHipTop < HIP_FULL_EXTENSION_ANGLE) issues.push("incomplete_stand");
             if (s.maxLean > TORSO_LEAN_MAX_DEGREES) issues.push("lean_warning");
-            if (s.maxWristRatio < ARM_PUSH_DISTANCE_RATIO) issues.push("arms_warning");
+            if (s.riseFrames >= 3 && s.handOnThighFrames / s.riseFrames >= HAND_ON_THIGH_MIN_SHARE) {
+              issues.push("arms_warning");
+            }
             playPhrase(issues[0] || "good_rep");
           }
 
           if (state === "SITTING") {
             s.stage = "SITTING";
             s.maxLean = 0;
-            s.maxWristRatio = 0;
+            s.riseFrames = 0;
+            s.handOnThighFrames = 0;
           } else if (state === "STANDING" && s.stage === "SITTING") {
             s.stage = "STANDING";
             if (counting) {
@@ -555,9 +582,16 @@ export default function MueenCoach() {
                 muted
                 aria-hidden="true"
               />
-              {!ready && <img src={exercisePreview} width={1200} height={912} alt="صورة توضيحية لتمرين الجلوس والوقوف" className="absolute inset-0 h-full w-full object-cover" />}
+              {!ready && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pb-24 text-primary" aria-hidden="true">
+                  <div className="grid size-24 place-items-center rounded-full bg-card/80 shadow-soft">
+                    <Armchair className="size-12" />
+                  </div>
+                  <p className="text-xl font-bold text-foreground">تمرين الجلوس والوقوف</p>
+                </div>
+              )}
               <canvas ref={canvasRef} className={ready ? "absolute inset-0 h-full w-full object-contain" : "absolute inset-0 h-full w-full opacity-0"} aria-label="عرض الكاميرا المباشر مع نقاط تتبّع الحركة" />
-              <div className="absolute right-4 top-4 flex items-center gap-2 rounded-full bg-card/95 px-4 py-2 text-base font-bold text-foreground shadow-soft sm:right-5 sm:top-5"><Camera className="size-5 text-primary" />{ready ? "الكاميرا المباشرة" : "صورة توضيحية"}</div>
+              <div className="absolute right-4 top-4 flex items-center gap-2 rounded-full bg-card/95 px-4 py-2 text-base font-bold text-foreground shadow-soft sm:right-5 sm:top-5"><Camera className="size-5 text-primary" />{ready ? "الكاميرا المباشرة" : "الكاميرا"}</div>
               {!ready && !cameraError && <div className="absolute bottom-5 left-5 right-5 rounded-2xl border border-surface-edge bg-card/95 px-5 py-4 shadow-soft"><p className="text-lg font-bold text-foreground">بانتظار تفعيل الكاميرا</p><p className="mt-1 text-base text-muted-foreground">اسمح للمتصفح باستخدام الكاميرا لبدء التمرين.</p></div>}
               {cameraError && <div className="absolute bottom-5 left-5 right-5 rounded-2xl border border-amber-edge bg-warmsoft px-5 py-4 shadow-soft"><p className="text-lg font-bold text-amber-deep">تعذّر تشغيل الكاميرا</p><p className="mt-1 text-base text-amber-deep">تأكد من السماح باستخدام الكاميرا ثم أعد تحميل الصفحة.</p></div>}
             </div>
