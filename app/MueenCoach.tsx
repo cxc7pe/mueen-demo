@@ -11,7 +11,6 @@ import {
   ArrowUp,
   MoveVertical,
   Mic,
-  AlertTriangle,
 } from "lucide-react";
 
 import { useEffect, useRef, useState } from "react";
@@ -30,12 +29,12 @@ const FEEDBACK_COOLDOWN_SEC = 4.0;
 // "user" = front camera (person sees themselves), "environment" = back camera
 const CAMERA_FACING: "user" | "environment" = "user";
 
-// Body-in-frame check
-const MIN_VISIBILITY = 0.5; // landmark confidence needed to count as visible
-const FRAME_MARGIN = 0.02; // landmark must be inside the frame by this margin
-const LOST_AFTER_SEC = 0.8; // body must be missing this long before we warn
-const OK_AFTER_SEC = 1.0; // body must be fully visible this long before starting
-const STEP_BACK_COOLDOWN_SEC = 7;
+// MUST match the installed @mediapipe/tasks-vision version in package.json.
+// A mismatch between the JS package and the wasm files breaks Safari/Firefox.
+const MEDIAPIPE_VERSION = "1.1.0";
+const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/wasm`;
+const MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 
 const exercisePreview = "/exercise-preview.jpg";
 
@@ -43,15 +42,7 @@ const LEFT_HIP = 23, LEFT_KNEE = 25, LEFT_ANKLE = 27, LEFT_SHOULDER = 11, LEFT_W
 const RIGHT_HIP = 24, RIGHT_KNEE = 26, RIGHT_ANKLE = 28, RIGHT_SHOULDER = 12, RIGHT_WRIST = 16;
 
 // Audio files live in /public/audio/<key>.mp3
-const PHRASES = [
-  "intro",
-  "good_rep",
-  "incomplete_stand",
-  "lean_warning",
-  "arms_warning",
-  "time_up",
-  "step_back",
-];
+const PHRASES = ["intro", "good_rep", "incomplete_stand", "lean_warning", "arms_warning", "time_up"];
 
 // ---------- Helpers ----------
 function calcAngle(a: number[], b: number[], c: number[]) {
@@ -73,22 +64,57 @@ function checkSitToStand(angle: number) {
   return "TRANSITIONING";
 }
 
-function inFrame(p: { x: number; y: number; visibility?: number }) {
-  return (
-    (p.visibility ?? 0) >= MIN_VISIBILITY &&
-    p.x > FRAME_MARGIN &&
-    p.x < 1 - FRAME_MARGIN &&
-    p.y > FRAME_MARGIN &&
-    p.y < 1 - FRAME_MARGIN
-  );
-}
-
 // Makes Arabic voice results easier to match (ابدأ / ابدا / إبدأ ...)
 function normalizeArabic(t: string) {
   return t
     .replace(/[أإآٱ]/g, "ا")
-    .replace(/[\u064B-\u0652]/g, "")
+    .replace(/[ً-ْ]/g, "")
     .trim();
+}
+
+// Safari (Mac + every browser on iPhone/iPad, which all use WebKit).
+// Continuous speech recognition there is unreliable and, on iPhone, turning the
+// mic on routes the voice feedback to the quiet earpiece. So we skip it there.
+function isWebKitSafari() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  const iOS =
+    /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const desktopSafari = /^((?!chrome|chromium|android|crios|fxios|edg).)*safari/i.test(ua);
+  return iOS || desktopSafari;
+}
+
+async function openCamera(): Promise<MediaStream> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("getUserMedia not supported (page must be opened over HTTPS)");
+  }
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: CAMERA_FACING, width: { ideal: 640 }, height: { ideal: 480 } },
+    });
+  } catch (err) {
+    // Some browsers reject the constraints; retry with the simplest request
+    if ((err as Error)?.name === "NotAllowedError") throw err;
+    return navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+  }
+}
+
+async function createLandmarker() {
+  const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+  const make = (delegate: "GPU" | "CPU") =>
+    PoseLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: MODEL_URL, delegate },
+      runningMode: "VIDEO",
+      numPoses: 1,
+    });
+  try {
+    return await make("GPU");
+  } catch (err) {
+    // GPU (WebGL) can fail on Safari / older phones: fall back to CPU
+    console.warn("GPU delegate failed, using CPU:", err);
+    return make("CPU");
+  }
 }
 
 // ---------- Component ----------
@@ -96,13 +122,15 @@ export default function MueenCoach() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const landmarkerRef = useRef<PoseLandmarker | null>(null);
-  const audioRef = useRef<Record<string, HTMLAudioElement>>({});
+  // One shared player: once a tap has "unlocked" it, iPhone Safari lets it
+  // play any clip later. Separate <audio> elements would each need their own tap.
+  const playerRef = useRef<HTMLAudioElement | null>(null);
+  const durationsRef = useRef<Record<string, number>>({});
   const lastPlayedRef = useRef<Record<string, number>>({});
   const rafRef = useRef<number>(0);
   const readyRef = useRef(false);
   const audioUnlockedRef = useRef(false);
-  const bodyOkRef = useRef(false);
-  const pendingStartRef = useRef(false);
+  const lastVideoTimeRef = useRef(-1);
   const stateRef = useRef({
     smoothedKnee: null as number | null,
     stage: null as string | null,
@@ -112,68 +140,64 @@ export default function MueenCoach() {
     minHip: 999,
     maxLean: 0,
     maxWristRatio: 0,
-    okSince: null as number | null,
-    lostSince: null as number | null,
   });
 
   const [reps, setReps] = useState(0);
   const [label, setLabel] = useState("");
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
   const [ready, setReady] = useState(false);
-  const [bodyWarning, setBodyWarning] = useState(false);
-  const [waiting, setWaiting] = useState(false);
   const [cameraError, setCameraError] = useState(false);
+  const [voiceSupported, setVoiceSupported] = useState(false);
 
-  // Mobile browsers block audio until the first tap. This "unlocks" every clip once.
+  // Must run inside a tap/click. Plays a clip silently to unlock audio on mobile.
   function unlockAudio() {
-    if (audioUnlockedRef.current) return;
-    audioUnlockedRef.current = true;
-    Object.values(audioRef.current).forEach((a) => {
-      a.muted = true;
-      a.play()
-        .then(() => {
-          a.pause();
-          a.currentTime = 0;
-          a.muted = false;
-        })
-        .catch(() => {
-          a.muted = false;
-        });
-    });
+    const player = playerRef.current;
+    // Skip if already unlocked, or if a phrase (e.g. the intro) is already playing
+    if (!player || audioUnlockedRef.current || !player.paused) return;
+    player.muted = true;
+    player.src = "/audio/good_rep.mp3";
+    player
+      .play()
+      .then(() => {
+        audioUnlockedRef.current = true;
+        // Only reset if a real phrase hasn't taken over the player meanwhile
+        if (player.muted) {
+          player.pause();
+          player.currentTime = 0;
+          player.muted = false;
+        }
+      })
+      .catch(() => {
+        player.muted = false; // try again on the next tap
+      });
   }
 
   function playPhrase(key: string, force = false, cooldown = FEEDBACK_COOLDOWN_SEC) {
+    const player = playerRef.current;
+    if (!player) return;
     const now = performance.now() / 1000;
     const last = lastPlayedRef.current[key] || 0;
     if (!force && now - last < cooldown) return;
 
-    // Don't talk over another clip with the step-back warning
-    if (
-      key === "step_back" &&
-      !force &&
-      Object.entries(audioRef.current).some(([k, a]) => k !== "step_back" && !a.paused && !a.ended)
-    ) {
-      return;
-    }
-
-    if (force) {
-      Object.values(audioRef.current).forEach((a) => {
-        a.pause();
-        a.currentTime = 0;
-      });
-    }
-    const audio = audioRef.current[key];
-    if (!audio) return;
-    audio.currentTime = 0;
-    audio.play().catch(() => {});
+    player.pause();
+    player.muted = false;
+    player.src = `/audio/${key}.mp3`;
+    player.currentTime = 0;
+    player
+      .play()
+      .then(() => {
+        audioUnlockedRef.current = true;
+      })
+      .catch((e) => console.warn("Audio blocked:", key, e?.name));
     lastPlayedRef.current[key] = now;
   }
 
-  function beginTest() {
+  // Called by the button and by the voice command
+  function startTest() {
+    if (!readyRef.current) return;
     const s = stateRef.current;
-    playPhrase("intro", true);
-    const introAudio = audioRef.current["intro"];
-    const introDuration = introAudio?.duration || 5;
+    playPhrase("intro", true); // inside the tap, so this also unlocks audio
+    const introDuration = durationsRef.current["intro"] || 5;
     s.testStart = performance.now() / 1000 + introDuration + 1.0;
     s.testDone = false;
     s.reps = 0;
@@ -182,74 +206,57 @@ export default function MueenCoach() {
     setTimeLeft(null);
   }
 
-  // Called by the button and by the voice command
-  function startTest() {
-    if (!readyRef.current) return;
-    unlockAudio();
-
-    // Body not fully visible: ask the user to step back, then start automatically
-    if (!bodyOkRef.current) {
-      pendingStartRef.current = true;
-      setWaiting(true);
-      playPhrase("step_back", true);
-      return;
-    }
-    pendingStartRef.current = false;
-    setWaiting(false);
-    beginTest();
-  }
-
-  function loop() {
+  function processFrame() {
     const video = videoRef.current;
     const landmarker = landmarkerRef.current;
     const canvas = canvasRef.current;
+    if (!video || !landmarker || !canvas) return;
+    if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return;
 
-    if (video && landmarker && canvas && video.readyState >= 2) {
-      const result = landmarker.detectForVideo(video, performance.now());
-      const ctx = canvas.getContext("2d")!;
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-      const s = stateRef.current;
-      const now = performance.now() / 1000;
-      const w = canvas.width, h = canvas.height;
+    const s = stateRef.current;
+    const now = performance.now() / 1000;
+    const w = canvas.width, h = canvas.height;
 
-      const personSeen = !!result.landmarks && result.landmarks.length > 0;
-      let bodyOk = false;
+    // Only run the model on a new camera frame (saves battery on phones)
+    if (video.currentTime !== lastVideoTimeRef.current) {
+      lastVideoTimeRef.current = video.currentTime;
+      const result = landmarker.detectForVideo(video, performance.now());
+      const lm = result.landmarks?.[0];
 
-      if (personSeen) {
-        const lm = result.landmarks[0];
+      if (lm && lm.length > RIGHT_ANKLE) {
+        const vis = (i: number) => lm[i]?.visibility ?? 0;
         const pt = (i: number) => [lm[i].x * w, lm[i].y * h];
 
-        const leftVis =
-          (lm[LEFT_HIP].visibility! + lm[LEFT_KNEE].visibility! + lm[LEFT_ANKLE].visibility!) / 3;
-        const rightVis =
-          (lm[RIGHT_HIP].visibility! + lm[RIGHT_KNEE].visibility! + lm[RIGHT_ANKLE].visibility!) / 3;
+        const leftVis = (vis(LEFT_HIP) + vis(LEFT_KNEE) + vis(LEFT_ANKLE)) / 3;
+        const rightVis = (vis(RIGHT_HIP) + vis(RIGHT_KNEE) + vis(RIGHT_ANKLE)) / 3;
         const useLeft = leftVis >= rightVis;
 
-        const hipI = useLeft ? LEFT_HIP : RIGHT_HIP;
-        const kneeI = useLeft ? LEFT_KNEE : RIGHT_KNEE;
-        const ankleI = useLeft ? LEFT_ANKLE : RIGHT_ANKLE;
-        const shoulderI = useLeft ? LEFT_SHOULDER : RIGHT_SHOULDER;
-        const wristI = useLeft ? LEFT_WRIST : RIGHT_WRIST;
+        const hip = pt(useLeft ? LEFT_HIP : RIGHT_HIP);
+        const knee = pt(useLeft ? LEFT_KNEE : RIGHT_KNEE);
+        const ankle = pt(useLeft ? LEFT_ANKLE : RIGHT_ANKLE);
+        const shoulder = pt(useLeft ? LEFT_SHOULDER : RIGHT_SHOULDER);
+        const wrist = pt(useLeft ? LEFT_WRIST : RIGHT_WRIST);
 
-        // Shoulder, hip, knee and ankle must all be visible and inside the frame
-        bodyOk = [shoulderI, hipI, kneeI, ankleI].every((i) => inFrame(lm[i]));
+        const kneeAngle = calcAngle(hip, knee, ankle);
+        const hipAngle = calcAngle(shoulder, hip, knee);
+        const lean = torsoLean(shoulder, hip);
+        const torsoLen = Math.hypot(shoulder[0] - hip[0], shoulder[1] - hip[1]) + 1e-6;
+        const wristHipRatio = Math.hypot(wrist[0] - hip[0], wrist[1] - hip[1]) / torsoLen;
 
-        if (bodyOk) {
-          const hip = pt(hipI), knee = pt(kneeI), ankle = pt(ankleI);
-          const shoulder = pt(shoulderI), wrist = pt(wristI);
-
-          const kneeAngle = calcAngle(hip, knee, ankle);
-          const hipAngle = calcAngle(shoulder, hip, knee);
-          const lean = torsoLean(shoulder, hip);
-          const torsoLen = Math.hypot(shoulder[0] - hip[0], shoulder[1] - hip[1]) + 1e-6;
-          const wristHipRatio = Math.hypot(wrist[0] - hip[0], wrist[1] - hip[1]) / torsoLen;
-
+        if (Number.isFinite(kneeAngle)) {
           s.smoothedKnee =
             s.smoothedKnee == null ? kneeAngle : SMOOTHING * kneeAngle + (1 - SMOOTHING) * s.smoothedKnee;
+        }
 
+        if (s.smoothedKnee != null) {
           const state = checkSitToStand(s.smoothedKnee);
           const counting = s.testStart != null && !s.testDone && now >= s.testStart;
 
@@ -277,60 +284,38 @@ export default function MueenCoach() {
             }
           }
           setLabel(state);
-
-          ctx.fillStyle = "lime";
-          [hip, knee, ankle, shoulder, wrist].forEach(([x, y]) => {
-            ctx.beginPath();
-            ctx.arc(x, y, 5, 0, 2 * Math.PI);
-            ctx.fill();
-          });
-        } else {
-          // Body cut off: pause rep detection and avoid a jump when they return
-          s.smoothedKnee = null;
-          setLabel("");
         }
+
+        ctx.fillStyle = "lime";
+        [hip, knee, ankle, shoulder, wrist].forEach(([x, y]) => {
+          ctx.beginPath();
+          ctx.arc(x, y, 5, 0, 2 * Math.PI);
+          ctx.fill();
+        });
       } else {
         s.smoothedKnee = null;
         setLabel("");
       }
+    }
 
-      // ----- Body-in-frame tracking -----
-      bodyOkRef.current = bodyOk;
-      if (bodyOk) {
-        if (s.okSince == null) s.okSince = now;
-        s.lostSince = null;
-      } else {
-        s.okSince = null;
-        if (s.lostSince == null) s.lostSince = now;
+    // ----- Timer -----
+    if (s.testStart != null && !s.testDone) {
+      const elapsed = now - s.testStart;
+      setTimeLeft(Math.ceil(Math.max(0, TEST_DURATION - elapsed)));
+      if (elapsed >= TEST_DURATION) {
+        s.testDone = true;
+        setTimeLeft(0);
+        playPhrase("time_up", true);
       }
-      const okStable = bodyOk && s.okSince != null && now - s.okSince >= OK_AFTER_SEC;
-      const lostStable = !bodyOk && s.lostSince != null && now - s.lostSince >= LOST_AFTER_SEC;
+    }
+  }
 
-      setBodyWarning(lostStable);
-
-      const testActive = s.testStart != null && !s.testDone;
-      // Speak only when it matters (a person is half in frame, or a test is running/waiting)
-      if (lostStable && (personSeen || testActive || pendingStartRef.current)) {
-        playPhrase("step_back", false, STEP_BACK_COOLDOWN_SEC);
-      }
-
-      // The user asked to start earlier; begin once the full body is visible
-      if (pendingStartRef.current && okStable) {
-        pendingStartRef.current = false;
-        setWaiting(false);
-        beginTest();
-      }
-
-      // ----- Timer -----
-      if (s.testStart != null && !s.testDone) {
-        const elapsed = now - s.testStart;
-        const remaining = Math.max(0, TEST_DURATION - elapsed);
-        setTimeLeft(remaining);
-        if (elapsed >= TEST_DURATION) {
-          s.testDone = true;
-          playPhrase("time_up", true);
-        }
-      }
+  function loop() {
+    // One bad frame must never stop the whole app
+    try {
+      processFrame();
+    } catch (err) {
+      console.warn("Frame skipped:", err);
     }
     rafRef.current = requestAnimationFrame(loop);
   }
@@ -340,41 +325,49 @@ export default function MueenCoach() {
     let cancelled = false;
     let stream: MediaStream | null = null;
 
+    const player = new Audio();
+    player.preload = "auto";
+    player.setAttribute("playsinline", "");
+    playerRef.current = player;
+
+    // Warm the cache and read clip lengths (needed for the intro delay)
     PHRASES.forEach((key) => {
-      audioRef.current[key] = new Audio(`/audio/${key}.mp3`);
+      const a = new Audio();
+      a.preload = "auto";
+      a.addEventListener("loadedmetadata", () => {
+        if (Number.isFinite(a.duration)) durationsRef.current[key] = a.duration;
+      });
+      a.src = `/audio/${key}.mp3`;
+      a.load();
     });
 
     async function init() {
       try {
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-        );
-        const landmarker = await PoseLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-            delegate: "GPU",
-          },
-          runningMode: "VIDEO",
-          numPoses: 1,
-        });
+        // Camera first so the permission prompt appears right away
+        stream = await openCamera();
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        const video = videoRef.current;
+        if (video) {
+          video.muted = true;
+          video.playsInline = true;
+          video.srcObject = stream;
+          try {
+            await video.play();
+          } catch (err) {
+            console.warn("video.play() was refused, will retry on tap:", err);
+          }
+        }
+
+        const landmarker = await createLandmarker();
         if (cancelled) {
           landmarker.close();
           return;
         }
         landmarkerRef.current = landmarker;
 
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: CAMERA_FACING },
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
-        }
         readyRef.current = true;
         setReady(true);
         rafRef.current = requestAnimationFrame(loop);
@@ -389,51 +382,64 @@ export default function MueenCoach() {
       cancelled = true;
       cancelAnimationFrame(rafRef.current);
       stream?.getTracks().forEach((t) => t.stop());
+      landmarkerRef.current?.close();
+      landmarkerRef.current = null;
+      player.pause();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Voice command: "ابدأ" / "توقف"
+  // Voice command: "ابدأ" / "توقف" (Chrome / Edge / Android only)
   useEffect(() => {
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      console.warn("Speech recognition not supported in this browser");
-      return;
-    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = window as any;
+    const SpeechRecognition = w.SpeechRecognition || w.webkitSpeechRecognition;
+    if (!SpeechRecognition || isWebKitSafari()) return;
 
+    let stopped = false;
+    let failures = 0;
+    let restartTimer: ReturnType<typeof setTimeout> | undefined;
     const recognition = new SpeechRecognition();
     recognition.lang = "ar-SA";
     recognition.continuous = true;
     recognition.interimResults = false;
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     recognition.onresult = (event: any) => {
+      failures = 0;
       if (!readyRef.current) return; // ignore commands until the camera/model are ready
       const raw = event.results[event.results.length - 1][0].transcript;
       const text = normalizeArabic(raw);
       if (text.includes("ابدا")) {
         startTest();
       } else if (text.includes("توقف")) {
-        pendingStartRef.current = false;
-        setWaiting(false);
         stateRef.current.testDone = true;
       }
     };
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     recognition.onerror = (e: any) => {
-      // Mic permission denied: stop retrying forever
-      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-        recognition.onend = null;
+      if (["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported"].includes(e.error)) {
+        stopped = true; // permanent problem: stop retrying, the button still works
+        setVoiceSupported(false);
+      } else if (e.error !== "no-speech" && e.error !== "aborted") {
+        failures += 1;
       }
     };
 
     recognition.onend = () => {
-      try {
-        recognition.start();
-      } catch {
-        /* already started */
-      }
+      if (stopped || failures > 5) return;
+      // Small delay avoids a tight restart loop on Android
+      restartTimer = setTimeout(() => {
+        try {
+          recognition.start();
+        } catch {
+          /* already started */
+        }
+      }, 300);
     };
+
+    recognition.onstart = () => setVoiceSupported(true);
 
     try {
       recognition.start();
@@ -442,17 +448,31 @@ export default function MueenCoach() {
     }
 
     return () => {
+      stopped = true;
+      clearTimeout(restartTimer);
       recognition.onend = null;
-      recognition.stop();
+      try {
+        recognition.stop();
+      } catch {
+        /* ignore */
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function handleUserGesture() {
+    unlockAudio();
+    // Safari sometimes refuses the first video.play(); a tap fixes it
+    const v = videoRef.current;
+    if (v && v.paused && v.srcObject) v.play().catch(() => {});
+  }
 
   return (
     <div
       dir="rtl"
       lang="ar"
-      onPointerDown={unlockAudio}
+      onClick={handleUserGesture}
+      onTouchEnd={handleUserGesture}
       className="min-h-screen bg-wellness font-ar text-foreground"
     >
       <div className="mx-auto max-w-[1400px] px-5 py-7 sm:px-8 lg:px-12 lg:py-10">
@@ -469,21 +489,20 @@ export default function MueenCoach() {
         <main className="grid items-stretch gap-6 lg:grid-cols-[1.7fr_1fr]">
           <section className="min-w-0" aria-label="الكاميرا ووضعية الجسم">
             <div className="relative aspect-[4/3] overflow-hidden rounded-3xl border border-surface-edge bg-secondary shadow-frost">
-              <video ref={videoRef} className="hidden" playsInline muted />
+              {/* Not display:none — Safari stops decoding hidden videos. It sits invisibly under the canvas. */}
+              <video
+                ref={videoRef}
+                className="pointer-events-none absolute inset-0 h-full w-full opacity-0"
+                autoPlay
+                playsInline
+                muted
+                aria-hidden="true"
+              />
               {!ready && <img src={exercisePreview} width={1200} height={912} alt="صورة توضيحية لتمرين الجلوس والوقوف" className="absolute inset-0 h-full w-full object-cover" />}
               <canvas ref={canvasRef} className={ready ? "absolute inset-0 h-full w-full object-contain" : "absolute inset-0 h-full w-full opacity-0"} aria-label="عرض الكاميرا المباشر مع نقاط تتبّع الحركة" />
               <div className="absolute right-4 top-4 flex items-center gap-2 rounded-full bg-card/95 px-4 py-2 text-base font-bold text-foreground shadow-soft sm:right-5 sm:top-5"><Camera className="size-5 text-primary" />{ready ? "الكاميرا المباشرة" : "صورة توضيحية"}</div>
               {!ready && !cameraError && <div className="absolute bottom-5 left-5 right-5 rounded-2xl border border-surface-edge bg-card/95 px-5 py-4 shadow-soft"><p className="text-lg font-bold text-foreground">بانتظار تفعيل الكاميرا</p><p className="mt-1 text-base text-muted-foreground">اسمح للمتصفح باستخدام الكاميرا لبدء التمرين.</p></div>}
               {cameraError && <div className="absolute bottom-5 left-5 right-5 rounded-2xl border border-amber-edge bg-warmsoft px-5 py-4 shadow-soft"><p className="text-lg font-bold text-amber-deep">تعذّر تشغيل الكاميرا</p><p className="mt-1 text-base text-amber-deep">تأكد من السماح باستخدام الكاميرا ثم أعد تحميل الصفحة.</p></div>}
-              {ready && bodyWarning && (
-                <div className="absolute bottom-5 left-5 right-5 flex items-center gap-3 rounded-2xl border border-amber-edge bg-warmsoft/95 px-5 py-4 shadow-soft" role="alert">
-                  <AlertTriangle className="size-6 shrink-0 text-amber-deep" />
-                  <div>
-                    <p className="text-lg font-bold text-amber-deep">ابتعد قليلًا ليظهر جسمك كاملًا</p>
-                    <p className="mt-0.5 text-base text-amber-deep">يجب أن تظهر الكتفان والركبتان والقدمان داخل الكاميرا.</p>
-                  </div>
-                </div>
-              )}
             </div>
             <div className="mt-4 flex min-h-24 flex-wrap items-center justify-between gap-4 rounded-2xl border border-surface-edge bg-card/80 px-6 py-4 shadow-soft">
               <div className="flex items-center gap-4"><div className="grid size-12 shrink-0 place-items-center rounded-full bg-secondary text-primary" aria-hidden="true">{label === "SITTING" ? <Armchair className="size-6" /> : label === "STANDING" ? <ArrowUp className="size-6" /> : <MoveVertical className="size-6" />}</div><div><p className="text-base font-semibold text-muted-foreground">وضعيتك الآن</p><p className="min-h-10 text-2xl font-extrabold text-brand-deep" aria-live="polite">{label === "SITTING" ? "جالس" : label === "STANDING" ? "واقف" : label === "TRANSITIONING" ? "في حركة" : "بانتظار الحركة"}</p></div></div>
@@ -498,11 +517,11 @@ export default function MueenCoach() {
             </div>
             <div className="rounded-3xl border border-amber-edge bg-warmsoft p-6 shadow-frost sm:p-7">
               <div className="flex items-center justify-between gap-3"><h3 className="text-xl font-bold">الوقت المتبقي</h3><Clock3 className="size-6 text-amber-deep" /></div>
-              <div className="mt-5 flex min-h-24 items-baseline gap-4"><span className="font-num text-7xl font-semibold leading-none text-amber-deep" role="timer">{(timeLeft == null ? TEST_DURATION : Math.min(TEST_DURATION, Math.ceil(timeLeft))).toLocaleString("ar-SA")}</span><span className="text-lg font-semibold text-amber-deep">ثانية</span></div>
-              <p className="mt-4 text-base font-semibold text-amber-deep">{waiting ? "بانتظار ظهور جسمك كاملًا في الكاميرا" : timeLeft === 0 ? "اكتمل التمرين، أحسنت!" : timeLeft == null ? "على مهل، ابدأ حين تكون مستعدًا" : timeLeft > TEST_DURATION ? "استعدّ، سيبدأ العدّ بعد التوجيه" : "خذ وقتك، كل حركة تُحسب"}</p>
+              <div className="mt-5 flex min-h-24 items-baseline gap-4"><span className="font-num text-7xl font-semibold leading-none text-amber-deep" role="timer">{(timeLeft == null ? TEST_DURATION : Math.min(TEST_DURATION, timeLeft)).toLocaleString("ar-SA")}</span><span className="text-lg font-semibold text-amber-deep">ثانية</span></div>
+              <p className="mt-4 text-base font-semibold text-amber-deep">{timeLeft === 0 ? "اكتمل التمرين، أحسنت!" : timeLeft == null ? "على مهل، ابدأ حين تكون مستعدًا" : timeLeft > TEST_DURATION ? "استعدّ، سيبدأ العدّ بعد التوجيه" : "خذ وقتك، كل حركة تُحسب"}</p>
             </div>
-            <div className="mt-auto flex items-center gap-3 rounded-2xl border border-primary/25 bg-secondary px-6 py-4 text-lg font-semibold text-primary"><Mic className="size-5 shrink-0" />اضغط زر البدء، أو قل «ابدأ» ليبدأ التمرين</div>
-            <Button variant="exercise" size="exercise" onClick={startTest} disabled={!ready} className="mt-3"><Play className="fill-current" />{waiting ? "بانتظار ظهور جسمك…" : timeLeft === 0 ? "ابدأ التمرين من جديد" : "ابدأ التمرين"}</Button>
+            <div className="mt-auto flex items-center gap-3 rounded-2xl border border-primary/25 bg-secondary px-6 py-4 text-lg font-semibold text-primary"><Mic className="size-5 shrink-0" />{voiceSupported ? "اضغط زر البدء، أو قل «ابدأ» ليبدأ التمرين" : "اضغط زر البدء ليبدأ التمرين"}</div>
+            <Button variant="exercise" size="exercise" onClick={startTest} disabled={!ready} className="mt-3"><Play className="fill-current" />{timeLeft === 0 ? "ابدأ التمرين من جديد" : "ابدأ التمرين"}</Button>
           </aside>
         </main>
         <footer className="mt-9 flex flex-wrap items-center justify-between gap-3 border-t border-border/70 pt-5 text-sm text-muted-foreground"><span>معين · رفيق الحركة</span><span>بخطوات هادئة، نحو نشاط أفضل</span></footer>
