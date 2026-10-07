@@ -19,8 +19,12 @@ import { FilesetResolver, PoseLandmarker } from "@mediapipe/tasks-vision";
 // ---------- Settings ----------
 const KNEE_STANDING_ANGLE = 160;
 const KNEE_SITTING_ANGLE = 100;
-const HIP_FULL_EXTENSION_ANGLE = 160;
-const TORSO_LEAN_MAX_DEGREES = 30;
+// Hip angle (shoulder-hip-knee) at the TOP of the stand. ~180 = fully upright.
+const HIP_FULL_EXTENSION_ANGLE = 155;
+// Some forward lean is normal when rising from a chair; only warn above this.
+const TORSO_LEAN_MAX_DEGREES = 45;
+// After reaching standing, wait this long (taking the best hip angle) before judging.
+const STAND_SETTLE_SEC = 0.7;
 const ARM_PUSH_DISTANCE_RATIO = 0.35;
 const TEST_DURATION = 30;
 const SMOOTHING = 0.3;
@@ -131,15 +135,22 @@ export default function MueenCoach() {
   const readyRef = useRef(false);
   const audioUnlockedRef = useRef(false);
   const lastVideoTimeRef = useRef(-1);
+  // The mic is switched off while Mueen talks / during the test. Leaving it on
+  // makes phones duck or stutter the voice, and it can hear its own intro.
+  const pauseMicRef = useRef<() => void>(() => {});
+  const resumeMicRef = useRef<() => void>(() => {});
+  const resumeMicTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const stateRef = useRef({
     smoothedKnee: null as number | null,
     stage: null as string | null,
     reps: 0,
     testStart: null as number | null,
     testDone: false,
-    minHip: 999,
     maxLean: 0,
     maxWristRatio: 0,
+    // Feedback for the current rep is decided a moment after standing up
+    judgeAt: null as number | null,
+    maxHipTop: 0,
   });
 
   const [reps, setReps] = useState(0);
@@ -196,12 +207,15 @@ export default function MueenCoach() {
   function startTest() {
     if (!readyRef.current) return;
     const s = stateRef.current;
+    clearTimeout(resumeMicTimerRef.current);
+    pauseMicRef.current();
     playPhrase("intro", true); // inside the tap, so this also unlocks audio
     const introDuration = durationsRef.current["intro"] || 5;
     s.testStart = performance.now() / 1000 + introDuration + 1.0;
     s.testDone = false;
     s.reps = 0;
     s.stage = null;
+    s.judgeAt = null;
     setReps(0);
     setTimeLeft(null);
   }
@@ -260,15 +274,29 @@ export default function MueenCoach() {
           const state = checkSitToStand(s.smoothedKnee);
           const counting = s.testStart != null && !s.testDone && now >= s.testStart;
 
-          if (state !== "SITTING") {
-            s.minHip = Math.min(s.minHip, hipAngle);
+          // While rising out of the chair: track forward lean and arm use
+          if (s.stage === "SITTING" && state !== "SITTING") {
             s.maxLean = Math.max(s.maxLean, lean);
             s.maxWristRatio = Math.max(s.maxWristRatio, wristHipRatio);
           }
 
+          // After standing up: track how straight the hips get at the top
+          if (s.judgeAt != null && state === "STANDING") {
+            s.maxHipTop = Math.max(s.maxHipTop, hipAngle);
+          }
+
+          // Give feedback once they've settled at the top (or started sitting again)
+          if (s.judgeAt != null && (now >= s.judgeAt || state !== "STANDING")) {
+            s.judgeAt = null;
+            const issues: string[] = [];
+            if (s.maxHipTop < HIP_FULL_EXTENSION_ANGLE) issues.push("incomplete_stand");
+            if (s.maxLean > TORSO_LEAN_MAX_DEGREES) issues.push("lean_warning");
+            if (s.maxWristRatio < ARM_PUSH_DISTANCE_RATIO) issues.push("arms_warning");
+            playPhrase(issues[0] || "good_rep");
+          }
+
           if (state === "SITTING") {
             s.stage = "SITTING";
-            s.minHip = 999;
             s.maxLean = 0;
             s.maxWristRatio = 0;
           } else if (state === "STANDING" && s.stage === "SITTING") {
@@ -276,11 +304,8 @@ export default function MueenCoach() {
             if (counting) {
               s.reps += 1;
               setReps(s.reps);
-              const issues: string[] = [];
-              if (s.minHip < HIP_FULL_EXTENSION_ANGLE) issues.push("incomplete_stand");
-              if (s.maxLean > TORSO_LEAN_MAX_DEGREES) issues.push("lean_warning");
-              if (s.maxWristRatio < ARM_PUSH_DISTANCE_RATIO) issues.push("arms_warning");
-              playPhrase(issues[0] || "good_rep");
+              s.maxHipTop = hipAngle;
+              s.judgeAt = now + STAND_SETTLE_SEC;
             }
           }
           setLabel(state);
@@ -306,6 +331,10 @@ export default function MueenCoach() {
         s.testDone = true;
         setTimeLeft(0);
         playPhrase("time_up", true);
+        // Turn the mic back on after the closing message has finished
+        const endDelay = ((durationsRef.current["time_up"] || 3) + 0.8) * 1000;
+        clearTimeout(resumeMicTimerRef.current);
+        resumeMicTimerRef.current = setTimeout(() => resumeMicRef.current(), endDelay);
       }
     }
   }
@@ -397,6 +426,7 @@ export default function MueenCoach() {
     if (!SpeechRecognition || isWebKitSafari()) return;
 
     let stopped = false;
+    let paused = false;
     let failures = 0;
     let restartTimer: ReturnType<typeof setTimeout> | undefined;
     const recognition = new SpeechRecognition();
@@ -410,10 +440,14 @@ export default function MueenCoach() {
       if (!readyRef.current) return; // ignore commands until the camera/model are ready
       const raw = event.results[event.results.length - 1][0].transcript;
       const text = normalizeArabic(raw);
-      if (text.includes("ابدا")) {
-        startTest();
+      const st = stateRef.current;
+      const testRunning = st.testStart != null && !st.testDone;
+      if (text.includes("ابدا") && !testRunning) {
+        // Release the mic first, then speak once the phone has switched audio back
+        pauseMicRef.current();
+        setTimeout(startTest, 400);
       } else if (text.includes("توقف")) {
-        stateRef.current.testDone = true;
+        st.testDone = true;
       }
     };
 
@@ -428,7 +462,7 @@ export default function MueenCoach() {
     };
 
     recognition.onend = () => {
-      if (stopped || failures > 5) return;
+      if (stopped || paused || failures > 5) return;
       // Small delay avoids a tight restart loop on Android
       restartTimer = setTimeout(() => {
         try {
@@ -441,6 +475,26 @@ export default function MueenCoach() {
 
     recognition.onstart = () => setVoiceSupported(true);
 
+    pauseMicRef.current = () => {
+      paused = true;
+      clearTimeout(restartTimer);
+      try {
+        recognition.abort();
+      } catch {
+        /* ignore */
+      }
+    };
+    resumeMicRef.current = () => {
+      if (stopped || !paused) return;
+      paused = false;
+      failures = 0;
+      try {
+        recognition.start();
+      } catch {
+        /* already started */
+      }
+    };
+
     try {
       recognition.start();
     } catch {
@@ -450,6 +504,9 @@ export default function MueenCoach() {
     return () => {
       stopped = true;
       clearTimeout(restartTimer);
+      clearTimeout(resumeMicTimerRef.current);
+      pauseMicRef.current = () => {};
+      resumeMicRef.current = () => {};
       recognition.onend = null;
       try {
         recognition.stop();
