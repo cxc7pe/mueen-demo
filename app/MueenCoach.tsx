@@ -15,6 +15,7 @@ import {
 
 import { useEffect, useRef, useState } from "react";
 import { FilesetResolver, PoseLandmarker } from "@mediapipe/tasks-vision";
+import { ResultsCard, type SessionResult } from "./ResultsPanel";
 
 // ---------- Settings ----------
 const KNEE_STANDING_ANGLE = 160;
@@ -139,17 +140,13 @@ async function createLandmarker() {
 }
 
 // ---------- Logo ----------
-// Person rising from a chair: the loop of م is the head, its tail the body; damma on top.
+// The letter مُ (Cairo typeface) in white, with an amber damma.
 function MueenLogo({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 100 100" className={className} aria-hidden="true">
       <rect width="100" height="100" rx="24" fill="#0C5A4C" />
-      <path transform="translate(41 10) scale(0.068 -0.068) translate(-19 -696)" fill="#D79313" d="M98 535Q82 607 98.5 651.5Q115 696 174 696Q213 696 233.0 675.5Q253 655 257.0 619.0Q261 583 250 535L203 544Q216 603 208.0 625.5Q200 648 174 648Q148 648 140.0 626.0Q132 604 145 545ZM19 535V583H250V535Z" />
-      <g fill="none" strokeLinecap="round" strokeLinejoin="round" transform="translate(9 19) scale(0.82)">
-        <path d="M70 64 H82 M82 47 V84" stroke="#fff" strokeOpacity={0.45} strokeWidth={7} />
-        <circle cx="44" cy="24" r="9.5" stroke="#fff" strokeWidth={9.5} />
-        <path d="M49 35 C55 42 61 48 63 56 C54 58 46 60 40 62 C40 69 40 75 39 82 L30 82" stroke="#fff" strokeWidth={12} />
-      </g>
+      <path transform="translate(48 9) scale(0.068 -0.068) translate(-19 -696)" fill="#D79313" d="M98 535Q82 607 98.5 651.5Q115 696 174 696Q213 696 233.0 675.5Q253 655 257.0 619.0Q261 583 250 535L203 544Q216 603 208.0 625.5Q200 648 174 648Q148 648 140.0 626.0Q132 604 145 545ZM19 535V583H250V535Z" />
+      <path transform="translate(26 61) scale(0.074 -0.074)" fill="#fff" d="M64 -332Q55 -279 47.5 -228.0Q40 -177 40 -137Q40 -55 72.5 5.0Q105 65 164.5 98.0Q224 131 304 131Q319 131 337.5 131.0Q356 131 381.5 131.0Q407 131 441.0 131.0Q475 131 520 131L458 71V248Q458 293 448.5 320.0Q439 347 412.0 359.5Q385 372 333 372Q297 372 258.0 366.5Q219 361 196 352L292 440Q285 416 279.5 380.5Q274 345 271.0 307.5Q268 270 268 238Q268 204 271.0 167.5Q274 131 278.5 102.5Q283 74 286 64L141 23Q136 38 130.0 70.0Q124 102 120.0 145.0Q116 188 116 237Q116 286 120.5 332.0Q125 378 132.0 415.5Q139 453 145 476Q172 486 224.0 494.5Q276 503 336 503Q406 503 454.0 489.0Q502 475 533.0 450.5Q564 426 581.0 394.0Q598 362 604.5 324.5Q611 287 611 247V0Q565 0 518.0 0.0Q471 0 427.5 0.0Q384 0 351.0 0.0Q318 0 304 0Q288 0 269.0 -4.5Q250 -9 232.5 -22.5Q215 -36 204.0 -63.5Q193 -91 193 -137Q193 -173 199.5 -220.5Q206 -268 214 -332Z" />
     </svg>
   );
 }
@@ -185,7 +182,10 @@ export default function MueenCoach() {
     // Feedback for the current rep is decided a moment after standing up
     judgeAt: null as number | null,
     maxHipTop: 0,
+    // Per-test tally for the results screen
+    counts: { good: 0, incomplete: 0, lean: 0, arms: 0 },
   });
+  const resultsRef = useRef<HTMLDivElement>(null);
 
   const [reps, setReps] = useState(0);
   const [label, setLabel] = useState("");
@@ -193,6 +193,15 @@ export default function MueenCoach() {
   const [ready, setReady] = useState(false);
   const [cameraError, setCameraError] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(false);
+  const [result, setResult] = useState<SessionResult | null>(null);
+
+  // Called a moment after the test ends (all rep judgements are in by then)
+  function finishTest() {
+    const s = stateRef.current;
+    setResult({ reps: s.reps, good: s.counts.good });
+    setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+    resumeMicRef.current();
+  }
 
   // Must run inside a tap/click. Plays a clip silently to unlock audio on mobile.
   function unlockAudio() {
@@ -250,7 +259,9 @@ export default function MueenCoach() {
     s.reps = 0;
     s.stage = null;
     s.judgeAt = null;
+    s.counts = { good: 0, incomplete: 0, lean: 0, arms: 0 };
     setReps(0);
+    setResult(null);
     setTimeLeft(null);
   }
 
@@ -334,7 +345,12 @@ export default function MueenCoach() {
             if (s.riseFrames >= 3 && s.handOnThighFrames / s.riseFrames >= HAND_ON_THIGH_MIN_SHARE) {
               issues.push("arms_warning");
             }
-            playPhrase(issues[0] || "good_rep");
+            if (issues.length === 0) s.counts.good += 1;
+            if (issues.includes("incomplete_stand")) s.counts.incomplete += 1;
+            if (issues.includes("lean_warning")) s.counts.lean += 1;
+            if (issues.includes("arms_warning")) s.counts.arms += 1;
+            // Don't talk over the "time's up" message for a rep that ended at the buzzer
+            if (!s.testDone) playPhrase(issues[0] || "good_rep");
           }
 
           if (state === "SITTING") {
@@ -374,10 +390,10 @@ export default function MueenCoach() {
         s.testDone = true;
         setTimeLeft(0);
         playPhrase("time_up", true);
-        // Turn the mic back on after the closing message has finished
-        const endDelay = ((durationsRef.current["time_up"] || 3) + 0.8) * 1000;
+        // After the closing message: show the results and turn the mic back on
+        const endDelay = ((durationsRef.current["time_up"] || 3) + 0.6) * 1000;
         clearTimeout(resumeMicTimerRef.current);
-        resumeMicTimerRef.current = setTimeout(() => resumeMicRef.current(), endDelay);
+        setTimeout(finishTest, endDelay);
       }
     }
   }
@@ -631,6 +647,11 @@ export default function MueenCoach() {
             <Button variant="exercise" size="exercise" onClick={startTest} disabled={!ready} className="mt-3"><Play className="fill-current" />{timeLeft === 0 ? "ابدأ التمرين من جديد" : "ابدأ التمرين"}</Button>
           </aside>
         </main>
+        {result && (
+          <section ref={resultsRef} className="mt-8 scroll-mt-6" aria-label="نتيجة التمرين">
+            <ResultsCard result={result} />
+          </section>
+        )}
         <footer className="mt-9 flex flex-wrap items-center justify-between gap-3 border-t border-border/70 pt-5 text-sm text-muted-foreground"><span>مُعين · رفيق الحركة</span><span>بخطوات هادئة، نحو نشاط أفضل</span></footer>
       </div>
     </div>
